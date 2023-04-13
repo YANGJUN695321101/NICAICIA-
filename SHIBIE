@@ -1,0 +1,302 @@
+import sys
+import json
+from PyQt5.QtCore import QThread, pyqtSignal, Qt, QPoint
+from PyQt5.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QLabel, QSlider, QPushButton, QTextEdit, QWidget, QCheckBox, QDoubleSpinBox
+from PyQt5.QtGui import QImage, QPixmap, QScreen
+from PIL import Image
+import pytesseract
+from PIL import Image, ImageOps
+from PyQt5.QtWidgets import QMainWindow
+from tencentcloud.common import credential
+from tencentcloud.common.profile.client_profile import ClientProfile
+from tencentcloud.common.profile.http_profile import HttpProfile
+from tencentcloud.tmt.v20180321 import tmt_client, models
+from PyQt5.QtCore import QTimer
+
+class TranslateThread(QThread):
+    translate_signal = pyqtSignal(str)
+
+    def __init__(self, text):
+        super().__init__()
+        self.text = text
+
+    def run(self):
+        # 替换为您自己的 SecretId 和 SecretKey
+        #下面的KEY要自己去申请哦'
+        #这是教程https://www.bilibili.com/video/BV13i4y1972U/?spm_id_from=333.337.search-card.all.click&vd_source=5f9ade688483faba116b4dd5dd482c46"
+        cred = credential.Credential("SecretId", "SecretKey")
+        http_profile = HttpProfile()
+        http_profile.endpoint = "tmt.tencentcloudapi.com"
+
+        client_profile = ClientProfile()
+        client_profile.httpProfile = http_profile
+        client = tmt_client.TmtClient(cred, "ap-guangzhou", client_profile)
+
+        source_lang, target_lang = self.detect_languages(self.text)
+
+        req = models.TextTranslateRequest()
+        params = {
+            "SourceText": self.text,
+            "Source": source_lang,
+            "Target": target_lang,
+            "ProjectId": 0
+        }
+        req.from_json_string(json.dumps(params))
+
+        resp = client.TextTranslate(req)
+        translated_text = json.loads(resp.to_json_string())["TargetText"]
+        self.translate_signal.emit(translated_text)
+
+    def detect_languages(self, text):
+        if any(u'\u4e00' <= c <= u'\u9fff' for c in text):
+            return "zh", "en"
+        else:
+            return "en", "zh"
+
+class OCRThread(QThread):
+    recognize_signal = pyqtSignal(str)
+
+    def __init__(self, bbox):
+        super().__init__()
+        self.bbox = bbox
+
+    def run(self):
+        screen = QApplication.primaryScreen()
+        x, y, width, height = self.bbox.x(), self.bbox.y(), self.bbox.width(), self.bbox.height()
+        screenshot = screen.grabWindow(0, x, y, width, height).toImage()
+        pil_image = Image.fromqpixmap(QPixmap.fromImage(screenshot))
+        recognized_text = self.recognize_image(pil_image)
+        self.recognize_signal.emit(recognized_text)
+
+    def preprocess_image(self, image):
+        gray_image = ImageOps.grayscale(image)
+        binary_image = gray_image.point(lambda x: 255 if x > 180 else 0)
+        scale_factor = 2
+        width, height = binary_image.size
+        binary_image = binary_image.resize(
+            (width * scale_factor, height * scale_factor), Image.BICUBIC)
+        return binary_image
+
+    def recognize_image(self, image):
+        pytesseract.pytesseract.tesseract_cmd = 'F:\\Tesseract-OCR\\tesseract.exe'
+        binary_image = self.preprocess_image(image)
+        text = pytesseract.image_to_string(
+            binary_image, lang='chi_sim+eng', config='--psm 6')
+        return text
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        self.active_threads = []
+        super().__init__()
+        self.setGeometry(100, 50, 400, 400)
+        self.setWindowTitle('OCR 文字识别')
+        self.init_ui()
+        self.init_child_ui()
+        self.ocr_thread = None
+        self.auto_recognize_timer = None
+        self.auto_recognize_frequency = 5000  # 默认为 5000 毫秒
+        # 切换模式复选框
+        self.switch_mode_checkbox = QCheckBox("识别模式")
+        self.switch_mode_checkbox.setChecked(True)  # 默认为识别模式
+        self.switch_mode_checkbox.stateChanged.connect(self.switch_mode)
+        self.hbox1.addWidget(self.switch_mode_checkbox)
+        self.setWindowFlags(Qt.WindowStaysOnTopHint)
+
+    def switch_mode(self, state):
+        if state == Qt.Checked:
+            # 启用识别模式
+            self.capture_btn.setEnabled(True)
+            self.auto_recognize_btn.setEnabled(True)
+            self.frequency_input.setEnabled(True)
+        else:
+            # 启用输入模式
+            self.capture_btn.setEnabled(False)
+            self.auto_recognize_btn.setEnabled(False)
+            self.frequency_input.setEnabled(False)
+
+
+    def init_ui(self):
+        # 主窗口布局
+        vbox = QVBoxLayout()
+        hbox1 = QHBoxLayout()
+        self.vbox = QVBoxLayout()
+        self.hbox1 = QHBoxLayout()
+
+        # “识别文字”按钮
+        self.capture_btn = QPushButton('识别文字', self)
+        self.capture_btn.clicked.connect(self.recognize_text)
+        self.hbox1.addWidget(self.capture_btn)
+        self.hbox1.addStretch(1)
+          
+        # “自动识别”按钮
+        self.hbox2 = QHBoxLayout()
+        self.auto_recognize_btn = QPushButton('自动识别', self)
+        self.auto_recognize_btn.setCheckable(True)
+        self.auto_recognize_btn.toggled.connect(self.toggle_auto_recognition)
+        self.hbox2.addWidget(self.auto_recognize_btn)
+
+        # 频率调节条
+        # 频率调节条
+        self.auto_recognize_frequency = 5.0
+
+        self.frequency_label = QLabel('自动识别频率')
+        self.frequency_input = QDoubleSpinBox()
+        self.frequency_input.setRange(0, 20)
+        self.frequency_input.setSingleStep(0.1)
+        self.frequency_input.setValue(5.0)
+        self.frequency_input.valueChanged.connect(self.set_auto_recognize_frequency)
+        self.hbox2.addWidget(self.frequency_label)
+        self.hbox2.addWidget(self.frequency_input)
+
+        self.frequency_value_label = QLabel('当前频率：{} 秒'.format(self.auto_recognize_frequency))
+        self.hbox2.addWidget(self.frequency_value_label)
+        self.hbox2.addStretch(1)
+
+
+        
+
+        # “显示翻译窗口”按钮
+        self.show_child_window_btn = QPushButton('显示翻译窗口', self)
+        self.show_child_window_btn.clicked.connect(self.show_child_window)
+        self.hbox1.addWidget(self.show_child_window_btn)
+
+        # 透明度调节条
+        self.hbox3 = QHBoxLayout()
+        self.opacity_label = QLabel('透明度')
+        self.hbox3.addWidget(self.opacity_label)
+        self.opacity_slider = QSlider(Qt.Horizontal)
+        self.opacity_slider.setRange(0, 100)
+        self.opacity_slider.setValue(50)
+        self.opacity_slider.valueChanged.connect(self.set_opacity)
+        self.hbox3.addWidget(self.opacity_slider)
+        
+        self.vbox.addLayout(self.hbox1)
+        self.vbox.addLayout(self.hbox2)
+        self.vbox.addLayout(self.hbox3)
+
+        # 文本编辑框
+        self.text_edit = QTextEdit(self)
+        self.vbox.addWidget(self.text_edit)
+
+        # 主窗口中心控件
+        central_widget = QWidget(self)
+        central_widget.setLayout(self.vbox)
+        self.setCentralWidget(central_widget)
+
+    def toggle_auto_recognition(self, checked):
+        if checked:
+            self.auto_recognize_timer = QTimer(self)
+            self.auto_recognize_timer.timeout.connect(self.recognize_text)
+            self.auto_recognize_timer.start(self.auto_recognize_frequency)
+        else:
+            self.auto_recognize_timer.stop()
+
+    def set_auto_recognize_frequency(self, value):
+        self.auto_recognize_frequency = value
+        if self.auto_recognize_timer is not None:
+            self.auto_recognize_timer.setInterval(int(self.auto_recognize_frequency * 1000))
+            self.frequency_value_label.setText('当前频率：{} 秒'.format(self.auto_recognize_frequency))
+            if self.hbox2.count() == 3:
+                self.hbox2.addWidget(self.frequency_value_label)
+            else:
+                self.hbox2.itemAt(3).widget().setText('当前频率：{} 秒'.format(self.auto_recognize_frequency))
+
+                    
+
+
+
+        
+
+    def init_child_ui(self):
+        self.child_window = QMainWindow(self)
+        self.child_window.setGeometry(200, 100, 300, 200)
+        self.child_window.setWindowTitle('翻译窗口')
+        child_widget = QWidget(self.child_window)
+        child_layout = QVBoxLayout()
+        child_text_edit = QTextEdit(self.child_window)
+        child_layout.addWidget(child_text_edit)
+        child_widget.setLayout(child_layout)
+        self.child_window.setCentralWidget(child_widget)
+
+        # 翻译按钮
+        self.translate_btn = QPushButton('翻译', self.child_window)
+        self.translate_btn.clicked.connect(self.translate_text)
+        child_layout.addWidget(self.translate_btn)
+        # 自动翻译按钮
+        self.auto_translate_btn = QPushButton('自动翻译', self.child_window)
+        self.auto_translate_btn.setCheckable(True)
+        self.auto_translate_btn.toggled.connect(self.toggle_auto_translation)
+        child_layout.addWidget(self.auto_translate_btn)
+        
+    def show_child_window(self):
+        self.child_window.show()
+        #self.child_window.setWindowModality(Qt.NonModal)  # 设置子窗口为非模态窗口
+    def toggle_auto_translation(self, checked):
+        if checked:
+            self.text_edit.textChanged.connect(self.auto_translate_text)
+        else:
+            self.text_edit.textChanged.disconnect(self.auto_translate_text)
+    def auto_translate_text(self):
+            self.translate_text()
+
+
+    def translate_text(self):
+        text = self.text_edit.toPlainText()
+        self.translate_thread = TranslateThread(text)
+        self.translate_thread.translate_signal.connect(self.update_child_text)
+        self.translate_thread.start()
+    def update_child_text(self, translated_text):
+        child_text_edit = self.child_window.findChild(QTextEdit)
+        child_text_edit.setPlainText(translated_text)
+
+    def recognize_text(self):
+        bbox = self.calculate_bbox()
+        self.ocr_thread = OCRThread(bbox)
+        self.ocr_thread.recognize_signal.connect(self.update_text)
+        self.ocr_thread.start()
+        self.active_threads.append(self.ocr_thread)
+        bbox = self.calculate_bbox()
+        self.ocr_thread = OCRThread(bbox)
+        self.ocr_thread.recognize_signal.connect(self.update_text)
+        self.ocr_thread.start()
+
+    def calculate_bbox(self):
+        frame_margin = self.frameGeometry().height() - self.geometry().height()
+        title_bar_height = self.frameGeometry().height() - self.geometry().height() - \
+            self.layout().contentsMargins().top()
+        text_edit_rect = self.text_edit.rect().translated(
+            self.mapToGlobal(self.text_edit.pos()))
+        screen_rect = QApplication.primaryScreen().geometry()
+        return text_edit_rect.intersected(screen_rect)
+
+    def update_text(self, text):
+        self.text_edit.setPlainText(text)
+
+    def set_opacity(self, value):
+        opacity = value / 100.0
+        self.setWindowOpacity(opacity)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close()
+
+    def closeEvent(self, event):
+        if self.ocr_thread is not None:
+            self.ocr_thread.quit()
+            self.ocr_thread.wait()
+            event.accept()
+    def auto_recognize_text(self,event):
+        self.recognize_text()
+        for thread in self.active_threads:
+           thread.quit()
+           thread.wait()
+           event.accept()
+
+
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    main_window = MainWindow()
+    main_window.show()
+    sys.exit(app.exec_())
